@@ -49,6 +49,7 @@ bool do_exec(int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
+    va_end(args);
 
     /*
      * TODO:
@@ -59,9 +60,6 @@ bool do_exec(int count, ...)
      *   as second argument to the execv() command.
      *
      */
-
-    va_end(args);
-
     fflush(stdout);
 
     pid_t pid = fork();
@@ -87,9 +85,8 @@ bool do_exec(int count, ...)
             perror("waitpid failed");
             return false;
         }
+        return WIFEXITED(status) && WEXITSTATUS(status) == 0;
     }
-
-    return true;
 }
 
 /**
