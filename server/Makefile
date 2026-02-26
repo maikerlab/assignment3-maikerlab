@@ -1,5 +1,5 @@
 CC := $(CROSS_COMPILE)gcc
-CFLAGS := -Wall -Wextra -Werror -std=c11 -D_POSIX_C_SOURCE=200809L
+CFLAGS := -g -Wall -Werror -D_POSIX_C_SOURCE=200809L
 TARGET := aesdsocket
 SRC := aesdsocket.c
 

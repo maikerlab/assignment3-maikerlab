@@ -10,22 +10,23 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <errno.h>
 
-#define SOCK_ADDRESS "127.0.0.1"
-#define SOCK_PORT 9000
-#define BUFSIZE 512
-#define SOCKET_DATA_FILE "/var/tmp/aesdsocketdata"
+#define SERVER_ADDR "127.0.0.1"
+#define SERVER_PORT 9000
+#define BUFSIZE 256
+#define TMPFILE "/var/tmp/aesdsocketdata"
 
 static int sock;
-static int client_sock;
-static int output_file;
+static int client_conn;
+FILE *fp_tmpfile;
 
 void cleanup(void)
 {
-    close(client_sock);
+    close(client_conn);
     close(sock);
-    close(output_file);
-    remove(SOCKET_DATA_FILE);
+    fclose(fp_tmpfile);
+    remove(TMPFILE);
     closelog();
 }
 
@@ -89,10 +90,17 @@ int main(int argc, char *argv[])
         log_and_exit("Failed to create socket");
     }
 
+    int optval = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0)
+    {
+        syslog(LOG_ERR, "setsockopt: %s", strerror(errno));
+        log_and_exit("Failed to set socket options");
+    }
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(SOCK_PORT);
+    addr.sin_port = htons(SERVER_PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
@@ -108,12 +116,11 @@ int main(int argc, char *argv[])
         log_and_exit("Failed to listen on socket");
     }
 
-    printf("Server listening on %s:%d\n", SOCK_ADDRESS, SOCK_PORT);
-    syslog(LOG_INFO, "Listening on %s:%d", SOCK_ADDRESS, SOCK_PORT);
+    printf("Server listening on %s:%d\n", SERVER_ADDR, SERVER_PORT);
+    syslog(LOG_INFO, "Listening on %s:%d", SERVER_ADDR, SERVER_PORT);
 
-    output_file = open(SOCKET_DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
-    if (output_file < 0)
-    {
+    fp_tmpfile = fopen(TMPFILE, "a+");
+    if (!fp_tmpfile) {
         log_and_exit("Failed to open output file");
     }
 
@@ -121,8 +128,8 @@ int main(int argc, char *argv[])
     {
         // start accepting new clients until a signal is received
         socklen_t socklen = sizeof addr;
-        client_sock = accept(sock, (struct sockaddr *)&addr, &socklen);
-        if (client_sock == -1)
+        client_conn = accept(sock, (struct sockaddr *)&addr, &socklen);
+        if (client_conn == -1)
         {
             log_and_exit("Failed to accept connection");
         }
@@ -130,66 +137,59 @@ int main(int argc, char *argv[])
         syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(addr.sin_addr));
 
         char buf[BUFSIZE];
-        size_t data_len = 0;
-        bool receiving = true;
-        while (receiving)
+        while (1)
         {
-            ssize_t bytes_received = recv(client_sock, buf, BUFSIZE, 0);
+            ssize_t bytes_received = recv(client_conn, buf, BUFSIZE, 0);
             if (bytes_received < 0)
             {
                 syslog(LOG_ERR, "Failed to receive data");
-                close(client_sock);
-                receiving = false;
+                break;
             }
             else if (bytes_received == 0)
             {
-                receiving = false;
+                // finished receiving data from client
+                break;
             }
-            else
-            {
-                syslog(LOG_INFO, "Received %zd bytes of data", bytes_received);
-                data_len += bytes_received;
 
-                char *newline = memchr(buf, '\n', data_len);
-                if (newline != NULL)
-                {
-                    size_t line_len = newline - buf + 1;
-                    ssize_t bytes_written = write(output_file, buf, line_len);
-                    if (bytes_written < 0)
-                    {
-                        syslog(LOG_ERR, "Failed to write to output file");
-                        cleanup();
-                        return -1;
-                    }
-
-                    memmove(buf, buf + line_len, data_len - line_len);
-                    data_len -= line_len;
-                }
-
-                if (data_len == BUFSIZE)
-                {
-                    syslog(LOG_ERR, "Line too long!");
-                    data_len = 0; // reset buffer
-                }
+            ssize_t bytes_written = fwrite(buf, 1, bytes_received, fp_tmpfile);
+            if (bytes_written < bytes_received) {
+                syslog(LOG_ERR, "fwrite: partial write");
+                break;
             }
-        }
 
-        syslog(LOG_INFO, "Sending back file contents to client");
-        lseek(output_file, 0, SEEK_SET);
-        ssize_t n_bytes;
-        memset(buf, 0, BUFSIZE);
-        while ((n_bytes = read(output_file, buf, BUFSIZE)) > 0)
-        {
-            syslog(LOG_INFO, "Sending '%.*s' (%zd  bytes) back to client", (int)n_bytes, buf, n_bytes);
-            ssize_t bytes_sent = send(client_sock, buf, n_bytes, 0);
-            if (bytes_sent < 0)
-            {
-                syslog(LOG_ERR, "Failed to send data to client");
+            if (memchr(buf, '\n', bytes_received)) {
+                fflush(fp_tmpfile);
                 break;
             }
         }
+
+        fflush(fp_tmpfile);
+        fseek(fp_tmpfile, 0, SEEK_SET);
+
+        while (!feof(fp_tmpfile))
+        {
+            size_t bytes_read = fread(buf, 1, BUFSIZE, fp_tmpfile);
+            if (ferror(fp_tmpfile))
+            {
+                syslog(LOG_ERR, "Failed to read from output file");
+                break;
+            }
+            
+            size_t bytes_sent = 0;
+            while (bytes_sent < bytes_read)
+            {
+                ssize_t sent_now = send(client_conn, buf+bytes_sent, bytes_read-bytes_sent, 0);
+                if (sent_now < 0)                {
+                    syslog(LOG_ERR, "Failed to send data to client");
+                    break;
+                }
+                bytes_sent += sent_now;
+            }
+        }
+
+        close(client_conn);
+        rewind(fp_tmpfile);
         syslog(LOG_INFO, "Closed connection from %s", inet_ntoa(addr.sin_addr));
-        close(client_sock);
     }
 
     cleanup();
