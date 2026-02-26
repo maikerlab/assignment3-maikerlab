@@ -1,5 +1,9 @@
+#!/bin/sh
+#
+# Starts/stops aesdsocket binary.
+#
+
 EXECUTABLE=/usr/bin/aesdsocket
-EXECUTABLE=$(pwd)/aesdsocket
 PIDFILE=/var/run/aesdsocket.pid
 
 case "$1" in 
